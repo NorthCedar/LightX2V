@@ -529,3 +529,50 @@ GPU recovery or deployed task-retry behavior.
 ## License
 
 See the main project LICENSE file for licensing information.
+
+
+### Inference hang watchdog
+
+Each server rank starts a separate CPU-only monitor process before distributed
+initialization. It enforces monotonic wall-clock deadlines even when a native
+GPU call holds the rank's Python GIL. An expired deadline kills that rank without
+GPU cleanup; torchrun and the container supervisor must terminate peers and
+restart the runtime. The monitor emits best-effort bounded diagnostics using the
+fatal-error helper from #1685. A full stderr does not delay the kill.
+
+Set finite positive seconds through `LIGHTX2V_TIMEOUT_<STAGE>_S` before startup:
+
+| STAGE | Default seconds | Scope |
+| --- | ---: | --- |
+| INIT | 1800 | Distributed initialization and model loading |
+| TASK | 1800 | Entire request, including broadcast, inference and output |
+| BROADCAST | 60 | Rank-zero task distribution |
+| PREPARE | 300 | Request preparation and LoRA switching |
+| INFERENCE | 1800 | Runner invocation, for all model types |
+| INPUT_ENCODE | 300 | MiniMax-H3 input encoding |
+| TEXT_ENCODE | 120 | MiniMax-H3 text encoding, including profiler exit |
+| DENOISE | 900 | MiniMax-H3 denoising segment |
+| DECODE | 600 | MiniMax-H3 VAE decoding, including profiler exit |
+| BARRIER | 60 | Request/recovery barrier |
+| OUTPUT | 300 | Result PNG encoding |
+| CLEANUP | 60 | Runner and process-group shutdown |
+
+Nested stages retain their enclosing deadlines; switching stages does not reset
+the total request budget. Tune these limits for model size, video length and
+cold-start time. Runner stage guards do not add device synchronization or change
+collective order. They bound host-side stage completion, not individual kernels.
+Other model types retain the generic request/inference deadlines.
+
+`GET /health` returns 503 before readiness, during shutdown, when the task
+processing thread dies, when a deadline expires, or when the monitor exits.
+Its response includes the local rank, task, current stage and remaining budget
+when ready. The endpoint reads CPU state only; it does not launch collectives.
+This is local runtime health, not proof that all GPUs are responsive during idle.
+There is no idle keepalive or idle deadline. If the rank itself cannot serve HTTP,
+configure an external liveness probe to bound that failure too.
+
+CPU regression tests: `python3 -m unittest discover -s tests -p test_inference_watchdog.py -v`.
+They inject non-returning calls (including one holding the GIL), broadcast and
+barrier hangs, and check real process termination, ordinary errors, idle behavior,
+monitor failure and health responses. These do not establish recovery from a
+physical device fault; that requires validation on the target runtime.

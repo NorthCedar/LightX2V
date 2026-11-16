@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 from fastapi import FastAPI
 from loguru import logger
-from starlette.responses import RedirectResponse
+from starlette.responses import JSONResponse, RedirectResponse
 
 from ..metrics import monitor_cli
 from ..services import DistributedInferenceService
@@ -69,7 +69,11 @@ class ApiServer:
 
         @self.app.get("/health")
         def health_check():
-            return {"status": "ok"}
+            service = get_services().inference_service
+            state = service.health_status() if service is not None else {"status": "unhealthy", "reason": "service not initialized"}
+            if self.stop_processing.is_set() or self.processing_thread is None or not self.processing_thread.is_alive():
+                state = {**state, "status": "unhealthy", "reason": "task processing thread not running"}
+            return JSONResponse(state, status_code=200 if state["status"] == "ok" else 503)
 
         api_router = create_api_router()
         self.app.include_router(api_router)

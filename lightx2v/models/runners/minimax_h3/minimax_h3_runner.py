@@ -49,6 +49,7 @@ from lightx2v.models.video_encoders.hf.minimax_h3 import MiniMaxH3VideoVAE
 from lightx2v.server.metrics import monitor_cli
 from lightx2v.utils.envs import DTYPE_MAP, GET_RECORDER_MODE
 from lightx2v.utils.inference_errors import fatal_device_error_guard, terminate_on_fatal_device_error
+from lightx2v.utils.inference_watchdog import inference_stage
 from lightx2v.utils.input_info import INPUT_INFO_TYPES
 from lightx2v.utils.ltx2_media_io import encode_video
 from lightx2v.utils.profiler import ProfilingContext4DebugL1, ProfilingContext4DebugL2
@@ -359,6 +360,7 @@ class MiniMaxH3Runner(DefaultRunner):
         self.request_width = width
         self.request_num_frames = num_frames
 
+    @inference_stage("text_encode")
     @ProfilingContext4DebugL1(
         "Run Text Encoder",
         recorder_mode=GET_RECORDER_MODE(),
@@ -592,6 +594,7 @@ class MiniMaxH3Runner(DefaultRunner):
         self.source_audio_latents = self.audio_vae.encode(waveform).float()
         logger.info(f"MiniMax-H3 RGB regeneration source {source}: {source_width}x{source_height} -> {self.request_width}x{self.request_height}, audio=source")
 
+    @inference_stage("input_encode")
     @ProfilingContext4DebugL2("Run Input Encoder")
     def _run_input_encoder_local_h3(self):
         task = self.input_info.task
@@ -677,6 +680,7 @@ class MiniMaxH3Runner(DefaultRunner):
             self.model.ensure_block_offload_buffers()
         torch_device_module.synchronize()
 
+    @inference_stage("denoise")
     def run_segment(self, segment_idx=0):
         infer_steps = self.scheduler.infer_steps
         start_index = self.scheduler.start_step_index
@@ -739,6 +743,7 @@ class MiniMaxH3Runner(DefaultRunner):
             self.video_vae.set_decode_tile_shape(*tile_shape)
             logger.info(f"MiniMax-H3 Video VAE decode tile shape for {resolution}: {tile_shape[0]}x{tile_shape[1]}")
 
+    @inference_stage("decode")
     @ProfilingContext4DebugL1(
         "Run VAE Decoder",
         recorder_mode=GET_RECORDER_MODE(),

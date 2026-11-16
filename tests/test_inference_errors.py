@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import unittest
+from contextlib import nullcontext
 from functools import wraps
 from pathlib import Path
 from types import SimpleNamespace
@@ -235,7 +236,19 @@ class WorkerIntegrationTests(unittest.TestCase):
         path = MODULE.parents[1] / "server/services/inference/worker.py"
         tree = ast.parse(path.read_text())
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "TorchrunInferenceWorker")
+
+        class WatchdogStub:
+            def __init__(self, rank):
+                pass
+
+            def stage(self, name):
+                return nullcontext()
+
+            def close(self):
+                pass
+
         namespace = dict(
+            InferenceWatchdog=WatchdogStub,
             asyncio=asyncio,
             os=os,
             time=time,
@@ -248,7 +261,10 @@ class WorkerIntegrationTests(unittest.TestCase):
             terminate_on_fatal_device_error=lambda error: terminate(str(error)) if errors.is_fatal_device_error(error) else None,
         )
         exec(compile(ast.Module(body=[cls], type_ignores=[]), str(path), "exec"), namespace)
-        return namespace["TorchrunInferenceWorker"]
+        cls = namespace["TorchrunInferenceWorker"]
+        cls.watchdog = None
+        cls.ready = False
+        return cls
 
     def test_initialization_does_not_swallow_fatal_runner_errors(self):
         for fatal in (False, True):

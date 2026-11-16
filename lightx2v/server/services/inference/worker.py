@@ -9,6 +9,7 @@ from loguru import logger
 
 from lightx2v.models.runners.runner_factory import build_runner
 from lightx2v.utils.inference_errors import terminate_on_fatal_device_error
+from lightx2v.utils.inference_watchdog import InferenceWatchdog
 from lightx2v.utils.set_config import build_startup_config, init_parallel
 
 from ..distributed_utils import DistributedManager
@@ -19,6 +20,8 @@ class TorchrunInferenceWorker:
     def __init__(self):
         self.rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
+        self.watchdog = None
+        self.ready = False
         self.runner = None
         self.dist_manager = DistributedManager()
         self.processing = False
@@ -27,6 +30,21 @@ class TorchrunInferenceWorker:
         self.current_lora_strength = None
 
     def init(self, args) -> bool:
+        self.watchdog = InferenceWatchdog(self.rank)
+        try:
+            with self.watchdog.stage("init"):
+                self.ready = self._init(args)
+            return self.ready
+        finally:
+            if not self.ready:
+                self.watchdog.close()
+
+    def health_status(self):
+        if not self.ready or self.watchdog is None:
+            return {"status": "unhealthy", "reason": "worker not ready"}
+        return self.watchdog.snapshot()
+
+    def _init(self, args) -> bool:
         try:
             if self.world_size > 1:
                 if not self.dist_manager.init_process_group():
@@ -73,6 +91,17 @@ class TorchrunInferenceWorker:
             return False
 
     async def process_request(self, task_data: Dict[str, Any]) -> Dict[str, Any]:
+        if self.watchdog is None:
+            return await self._process_request(task_data)
+        with self.watchdog.task(task_data.get("task_id", "unknown")):
+            return await self._process_request(task_data)
+
+    def _stage(self, name):
+        from contextlib import nullcontext
+
+        return self.watchdog.stage(name) if self.watchdog is not None else nullcontext()
+
+    async def _process_request(self, task_data: Dict[str, Any]) -> Dict[str, Any]:
         has_error = False
         error_msg = ""
         error_type = ""
@@ -81,7 +110,8 @@ class TorchrunInferenceWorker:
 
         try:
             if self.world_size > 1 and self.rank == 0:
-                task_data = self.dist_manager.broadcast_task_data(task_data)
+                with self._stage("broadcast"):
+                    task_data = self.dist_manager.broadcast_task_data(task_data)
 
             task_id = task_data.pop("task_id", "unknown")
 
@@ -91,13 +121,14 @@ class TorchrunInferenceWorker:
             reuse = task_data.pop("reuse", False)
             reuse_prefix_segments = task_data.pop("reuse_prefix_segments", 0)
 
-            input_info = self.runner.prepare_request(task_data)
-            if self.lora_dir:
-                self.switch_lora(lora_name, lora_strength)
+            with self._stage("prepare"):
+                input_info = self.runner.prepare_request(task_data)
+                if self.lora_dir:
+                    self.switch_lora(lora_name, lora_strength)
 
-            self.runner.set_reuse(reuse, reuse_prefix_segments)
-            pipeline_return = self.runner.run_request(input_info)
-
+                self.runner.set_reuse(reuse, reuse_prefix_segments)
+            with self._stage("inference"):
+                pipeline_return = self.runner.run_request(input_info)
             await asyncio.sleep(0)
 
         except Exception as e:
@@ -109,7 +140,8 @@ class TorchrunInferenceWorker:
 
         if self.world_size > 1:
             try:
-                self.dist_manager.barrier()
+                with self._stage("barrier"):
+                    self.dist_manager.barrier()
             except Exception as e:
                 terminate_on_fatal_device_error(e)
                 raise
@@ -132,7 +164,8 @@ class TorchrunInferenceWorker:
                 }
                 if task_data.get("return_result_tensor"):
                     encode_start = time.perf_counter()
-                    png = encode_pipeline_return_to_png_bytes(pipeline_return)
+                    with self._stage("output"):
+                        png = encode_pipeline_return_to_png_bytes(pipeline_return)
                     encode_elapsed_ms = (time.perf_counter() - encode_start) * 1000
                     logger.info(f"Task {task_id} encode result_png cost {encode_elapsed_ms:.2f} ms")
                     if png:
@@ -209,7 +242,8 @@ class TorchrunInferenceWorker:
                 logger.error(f"Rank {self.rank} worker loop error: {error_str}")
                 if self.world_size > 1 and task_data is not None:
                     try:
-                        self.dist_manager.barrier()
+                        with self._stage("barrier"):
+                            self.dist_manager.barrier()
                     except Exception as barrier_error:
                         terminate_on_fatal_device_error(barrier_error)
                         logger.warning(f"Rank {self.rank} barrier failed, exiting: {barrier_error}")
@@ -217,6 +251,16 @@ class TorchrunInferenceWorker:
                 continue
 
     def cleanup(self):
+        self.ready = False
+        if self.watchdog is None:
+            return self._cleanup()
+        try:
+            with self.watchdog.stage("cleanup"):
+                self._cleanup()
+        finally:
+            self.watchdog.close()
+
+    def _cleanup(self):
         try:
             if self.runner is not None:
                 self.runner.close()

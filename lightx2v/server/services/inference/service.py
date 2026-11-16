@@ -51,6 +51,9 @@ class DistributedInferenceService:
             logger.error("Inference service is not started")
             return None
 
+        if self.health_status()["status"] != "ok":
+            raise RuntimeError("Inference worker is unhealthy")
+
         if self.worker.rank != 0:
             return None
 
@@ -71,6 +74,11 @@ class DistributedInferenceService:
                 "error": str(e),
                 "message": f"Task processing failed: {str(e)}",
             }
+
+    def health_status(self):
+        if not self.is_running or self.worker is None:
+            return {"status": "unhealthy", "reason": "inference service not running"}
+        return self.worker.health_status()
 
     def server_metadata(self):
         assert hasattr(self, "args"), "Distributed inference service has not been started. Call start_distributed_inference() first."
